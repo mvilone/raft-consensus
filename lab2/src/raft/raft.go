@@ -83,7 +83,7 @@ type Raft struct {
 	//1) persistent state on all servers
 	currentTerm int
 	votedFor    int
-	log         []int
+	log         []LogEntry
 
 	//2) volatile state on all servers.
 	commitIndex int
@@ -94,6 +94,7 @@ type Raft struct {
 	matchIndex []int
 
 	//4)channels for rafts to communicate
+	applyCh chan ApplyMsg
 
 	//state of server
 	state State
@@ -168,6 +169,11 @@ type RequestVoteReply struct {
 	VoteGranted bool
 }
 
+type LogEntry struct {
+	Command interface{}
+	Term    int
+}
+
 // example AppendEntries RPC arguments structure.
 // field names must start with capital letters!
 type AppendEntriesArgs struct {
@@ -177,7 +183,7 @@ type AppendEntriesArgs struct {
 	LeaderId     int
 	PrevLogIndex int
 	PrevLogTerm  int
-	Entries      []int
+	Entries      []LogEntry
 	LeaderCommit int
 }
 
@@ -258,12 +264,20 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
+func min(a int, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 // example AppendEntries RPC handler
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	reply.Term = rf.currentTerm
+
 	if args.Term < rf.currentTerm {
 		reply.Success = false
 		return
@@ -274,22 +288,86 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.votedFor = -1
 		rf.state = Follower
 	}
+
+	if args.PrevLogIndex >= len(rf.log) {
+		reply.Success = false
+		return
+	}
+
+	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		reply.Success = false
+		return
+	}
+
+	newIndex := args.PrevLogIndex + 1
+	j := 0
+	for ; j < len(args.Entries); j++ {
+		i := newIndex + j
+		if i >= len(rf.log) {
+			break
+		}
+		if rf.log[i].Term != args.Entries[j].Term {
+			// Conflict found – truncate everything from this point
+			rf.log = rf.log[:i]
+			break
+		}
+	}
+
+	//Append any new entries
+	rf.log = append(rf.log, args.Entries[j:]...)
+
+	lastNewIndex := args.PrevLogIndex + len(args.Entries)
+	if args.LeaderCommit > rf.commitIndex {
+		rf.commitIndex = min(args.LeaderCommit, lastNewIndex)
+	}
+
 	if args.Term >= rf.currentTerm {
 		rf.lastHeartBeat = time.Now()
 	}
 	reply.Success = true
 
-	//duration := 400 + rand.Float64()*(650-400)
-	//time.Sleep(time.Duration(duration) * time.Millisecond)
+}
 
+func (rf *Raft) getLogTerm(index int) int {
+	if index < 0 || index >= len(rf.log) {
+		return -1
+	}
+	return rf.log[index].Term
 }
 
 // example AppendEntries RPC handler
+// sendAppendEntries sends AppendEntries RPCs to followers and processes the replies
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	// Your code here (2A, 2B).
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
-	// Your code here (2A)
-	// Hint: Think about different states, term, how to deal with the reply.
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if reply.Success {
+		rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
+		rf.nextIndex[server] = rf.matchIndex[server] + 1
+
+		// Leader attempts to advance commitIndex
+		if rf.state == Leader {
+			for N := rf.getLastLogIndex(); N > rf.commitIndex; N-- {
+				count := 1 // Count self
+				for i := 0; i < len(rf.peers); i++ {
+					if i != rf.me && rf.matchIndex[i] >= N {
+						count++
+					}
+				}
+				if count > len(rf.peers)/2 && rf.getLogTerm(N) == rf.currentTerm {
+					rf.commitIndex = N
+					break
+				}
+			}
+		}
+	} else {
+		// Decrement nextIndex if replication failed (minimum is 1)
+		if rf.nextIndex[server] > 1 {
+			rf.nextIndex[server]--
+		}
+	}
 
 	return ok
 }
@@ -298,18 +376,36 @@ func (rf *Raft) HeartBeat() {
 	rf.mu.Lock()
 	currentTerm := rf.currentTerm
 	leaderId := rf.me
+	commitIndex := rf.commitIndex
 	rf.mu.Unlock()
+
 	for i := 0; i < len(rf.peers); i++ {
 		if i != rf.me {
 			go func(peer int) {
-				args := &AppendEntriesArgs{}
+				rf.mu.Lock()
+
+				// Construct proper AppendEntriesArgs
+				prevLogIndex := rf.nextIndex[peer] - 1
+				prevLogTerm := 0
+				if prevLogIndex >= 0 && prevLogIndex < len(rf.log) {
+					prevLogTerm = rf.log[prevLogIndex].Term
+				}
+
+				entries := make([]LogEntry, 0) // heartbeat: no new entries
+
+				args := &AppendEntriesArgs{currentTerm, leaderId, prevLogIndex, prevLogTerm, entries, commitIndex}
+
+				rf.mu.Unlock()
+
 				reply := &AppendEntriesReply{}
-				args.Term = currentTerm
-				args.LeaderId = leaderId
 				rf.sendAppendEntries(peer, args, reply)
 			}(i)
 		}
 	}
+}
+
+func (rf *Raft) getLastLogIndex() int {
+	return len(rf.log) - 1
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -325,17 +421,26 @@ func (rf *Raft) HeartBeat() {
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
-
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	// Your code here (2B).
-	// Hint: only leader is the truth.
+	if rf.state != Leader {
+		return -1, rf.currentTerm, false
+	}
 
-	return index, term, isLeader
+	entry := LogEntry{Command: command, Term: rf.currentTerm}
+	rf.log = append(rf.log, entry)
+
+	index := rf.getLastLogIndex()
+	term := rf.currentTerm
+
+	for i := range rf.peers {
+		if i != rf.me {
+			go rf.replicateToPeer(i)
+		}
+	}
+
+	return index, term, true
 }
 
 // the tester calls Kill() when a Raft instance won't
@@ -410,9 +515,16 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	rf.applyCh = applyCh
+	rf.log = append(rf.log, LogEntry{Term: 0})
 	rf.state = Follower
 	rf.currentTerm = 0
 	rf.votedFor = -1
+	rf.matchIndex = make([]int, len(peers))
+	rf.nextIndex = make([]int, len(peers))
+	for i := range rf.nextIndex {
+		rf.nextIndex[i] = rf.getLastLogIndex() + 1
+	}
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -427,7 +539,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			rf.mu.Unlock()
 			duration := 400 + rand.Float64()*(650-400)
 			timeout := time.Duration(duration) * time.Millisecond
-			time.Sleep(10 * time.Millisecond)
 			if (state != Leader) && (time.Since(last) >= timeout) {
 				rf.election()
 			}
@@ -439,5 +550,82 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	}()
 
+	go func() {
+		for {
+			rf.mu.Lock()
+			commitIndex := rf.commitIndex
+			lastApplied := rf.lastApplied
+			rf.mu.Unlock()
+
+			if commitIndex > lastApplied {
+				entriesToApply := rf.log[lastApplied+1 : commitIndex+1]
+				for _, entry := range entriesToApply {
+					rf.mu.Lock()
+					rf.lastApplied++
+					appliedIndex := rf.lastApplied
+					rf.mu.Unlock()
+					rf.applyCh <- ApplyMsg{
+						CommandValid: true,
+						Command:      entry.Command,
+						CommandIndex: appliedIndex,
+					}
+
+				}
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}()
+
 	return rf
+}
+
+func (rf *Raft) replicateToPeer(peer int) {
+	for {
+		rf.mu.Lock()
+		if rf.state != Leader {
+			rf.mu.Unlock()
+			return
+		}
+		prevLogIndex := rf.nextIndex[peer] - 1
+		prevLogTerm := -1
+		if prevLogIndex >= 0 && prevLogIndex < len(rf.log) {
+			prevLogTerm = rf.log[prevLogIndex].Term
+		}
+		entries := make([]LogEntry, len(rf.log[rf.nextIndex[peer]:]))
+		copy(entries, rf.log[rf.nextIndex[peer]:])
+		args := &AppendEntriesArgs{
+			Term:         rf.currentTerm,
+			LeaderId:     rf.me,
+			PrevLogIndex: prevLogIndex,
+			PrevLogTerm:  prevLogTerm,
+			Entries:      entries,
+			LeaderCommit: rf.commitIndex,
+		}
+		rf.mu.Unlock()
+
+		reply := &AppendEntriesReply{}
+		if rf.sendAppendEntries(peer, args, reply) {
+			rf.mu.Lock()
+			if reply.Success {
+				rf.matchIndex[peer] = args.PrevLogIndex + len(args.Entries)
+				rf.nextIndex[peer] = rf.matchIndex[peer] + 1
+				rf.mu.Unlock()
+				return
+			} else {
+				if reply.Term > rf.currentTerm {
+					rf.state = Follower
+					rf.currentTerm = reply.Term
+					rf.votedFor = -1
+					rf.mu.Unlock()
+					return
+				}
+				if rf.nextIndex[peer] > 1 {
+					rf.nextIndex[peer]--
+				}
+			}
+			rf.mu.Unlock()
+		}
+
+		time.Sleep(10 * time.Millisecond)
+	}
 }
