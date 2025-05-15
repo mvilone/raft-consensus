@@ -198,25 +198,37 @@ type AppendEntriesReply struct {
 
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here (2A, 2B).
-	// Hint: use lock!
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
+	// Reject if the term is stale
 	if args.Term < rf.currentTerm {
 		reply.VoteGranted = false
+		reply.Term = rf.currentTerm
 		return
 	}
+
+	// If candidate's term is higher, step down
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.state = Follower
 		rf.votedFor = -1
 	}
-	if (rf.votedFor == -1) || (rf.votedFor == args.CandidateId) {
+
+	// Check if candidate's log is at least as up to date
+	lastLogIndex := rf.getLastLogIndex()
+	lastLogTerm := rf.getLogTerm(lastLogIndex)
+
+	upToDate := (args.LastLogTerm > lastLogTerm) ||
+		(args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex)
+
+	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && upToDate {
 		rf.votedFor = args.CandidateId
 		reply.VoteGranted = true
 	} else {
 		reply.VoteGranted = false
 	}
+
 	reply.Term = rf.currentTerm
 }
 
@@ -273,59 +285,62 @@ func min(a int, b int) int {
 
 // example AppendEntries RPC handler
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	// Your code here (2A, 2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
 	reply.Term = rf.currentTerm
 
+	// 1. Reply false if term < currentTerm (§5.1)
 	if args.Term < rf.currentTerm {
 		reply.Success = false
 		return
 	}
 
+	// 2. If term >= currentTerm, step down if necessary
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
-		rf.votedFor = -1
 		rf.state = Follower
+		rf.votedFor = -1
 	}
+	rf.lastHeartBeat = time.Now()
 
+	// 3. Reply false if log doesn't contain an entry at prevLogIndex
 	if args.PrevLogIndex >= len(rf.log) {
 		reply.Success = false
 		return
 	}
 
+	// 4. Reply false if log term at prevLogIndex doesn't match
 	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		reply.Success = false
+		// Optional: for optimization, return conflict info
 		return
 	}
 
+	// 5. Append any new entries, deleting conflicting entries first
 	newIndex := args.PrevLogIndex + 1
-	j := 0
-	for ; j < len(args.Entries); j++ {
-		i := newIndex + j
-		if i >= len(rf.log) {
-			break
-		}
-		if rf.log[i].Term != args.Entries[j].Term {
-			// Conflict found – truncate everything from this point
-			rf.log = rf.log[:i]
+	for i, entry := range args.Entries {
+		if newIndex+i < len(rf.log) {
+			if rf.log[newIndex+i].Term != entry.Term {
+				// Conflict: delete the existing entry and all that follow it
+				rf.log = rf.log[:newIndex+i]
+				rf.log = append(rf.log, args.Entries[i:]...)
+				break
+			}
+		} else {
+			// We're past the end of rf.log — safe to append
+			rf.log = append(rf.log, args.Entries[i:]...)
 			break
 		}
 	}
 
-	// ✅ Append any new entries
-	rf.log = append(rf.log, args.Entries[j:]...)
-
-	lastNewIndex := args.PrevLogIndex + len(args.Entries)
+	// 6. Update commitIndex if leaderCommit > commitIndex
 	if args.LeaderCommit > rf.commitIndex {
+		lastNewIndex := args.PrevLogIndex + len(args.Entries)
 		rf.commitIndex = min(args.LeaderCommit, lastNewIndex)
 	}
 
-	if args.Term >= rf.currentTerm {
-		rf.lastHeartBeat = time.Now()
-	}
 	reply.Success = true
-
 }
 
 func (rf *Raft) getLogTerm(index int) int {
@@ -508,6 +523,9 @@ func (rf *Raft) election() {
 				reply := &RequestVoteReply{}
 				args.Term = currentTerm
 				args.CandidateId = candidateId
+				args.LastLogIndex = rf.getLastLogIndex()
+				args.LastLogTerm = rf.getLogTerm(args.LastLogIndex)
+
 				rf.sendRequestVote(peer, args, reply)
 				if reply.Term > currentTerm {
 					rf.mu.Lock()
