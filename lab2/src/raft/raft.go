@@ -313,7 +313,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 	}
 
-	//Append any new entries
+	// ✅ Append any new entries
 	rf.log = append(rf.log, args.Entries[j:]...)
 
 	lastNewIndex := args.PrevLogIndex + len(args.Entries)
@@ -358,6 +358,24 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 				}
 				if count > len(rf.peers)/2 && rf.getLogTerm(N) == rf.currentTerm {
 					rf.commitIndex = N
+
+					//NEW: Apply entries up to new commitIndex
+					go func(start int) {
+						rf.mu.Lock()
+						defer rf.mu.Unlock()
+						for rf.lastApplied < rf.commitIndex {
+							rf.lastApplied++
+							applyMsg := ApplyMsg{
+								CommandValid: true,
+								Command:      rf.log[rf.lastApplied].Command,
+								CommandIndex: rf.lastApplied,
+							}
+							rf.mu.Unlock()
+							rf.applyCh <- applyMsg
+							rf.mu.Lock()
+						}
+					}(rf.lastApplied + 1)
+
 					break
 				}
 			}
@@ -421,26 +439,47 @@ func (rf *Raft) getLastLogIndex() int {
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
+	index := -1
+	term := -1
+
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	// Your code here (2B).
+	// Hint: only leader is the truth.
 	if rf.state != Leader {
 		return -1, rf.currentTerm, false
 	}
 
-	entry := LogEntry{Command: command, Term: rf.currentTerm}
-	rf.log = append(rf.log, entry)
+	isLeader := (rf.state == Leader)
 
-	index := rf.getLastLogIndex()
-	term := rf.currentTerm
-
-	for i := range rf.peers {
+	log_entry := LogEntry{command, rf.currentTerm}
+	rf.log = append(rf.log, log_entry)
+	for i := 0; i < len(rf.peers); i++ {
 		if i != rf.me {
-			go rf.replicateToPeer(i)
+			go func(peer int) {
+				rf.mu.Lock()
+				term := rf.currentTerm
+				leaderId := rf.me
+				commitIndex := rf.commitIndex
+				prevLogIndex := rf.nextIndex[peer] - 1
+				prevLogTerm := 0
+				if (prevLogIndex >= 0) && (prevLogIndex < len(rf.log)) {
+					prevLogTerm = rf.log[prevLogIndex].Term
+				}
+				entries := make([]LogEntry, len(rf.log[rf.nextIndex[peer]:]))
+				copy(entries, rf.log[rf.nextIndex[peer]:])
+				args := &AppendEntriesArgs{term, leaderId, prevLogIndex, prevLogTerm, entries, commitIndex}
+				rf.mu.Unlock()
+				reply := &AppendEntriesReply{}
+				rf.sendAppendEntries(peer, args, reply)
+			}(i)
 		}
 	}
+	index = rf.getLastLogIndex()
+	term = rf.currentTerm
 
-	return index, term, true
+	return index, term, isLeader
 }
 
 // the tester calls Kill() when a Raft instance won't
@@ -577,55 +616,4 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	}()
 
 	return rf
-}
-
-func (rf *Raft) replicateToPeer(peer int) {
-	for {
-		rf.mu.Lock()
-		if rf.state != Leader {
-			rf.mu.Unlock()
-			return
-		}
-		prevLogIndex := rf.nextIndex[peer] - 1
-		prevLogTerm := -1
-		if prevLogIndex >= 0 && prevLogIndex < len(rf.log) {
-			prevLogTerm = rf.log[prevLogIndex].Term
-		}
-		entries := make([]LogEntry, len(rf.log[rf.nextIndex[peer]:]))
-		copy(entries, rf.log[rf.nextIndex[peer]:])
-		args := &AppendEntriesArgs{
-			Term:         rf.currentTerm,
-			LeaderId:     rf.me,
-			PrevLogIndex: prevLogIndex,
-			PrevLogTerm:  prevLogTerm,
-			Entries:      entries,
-			LeaderCommit: rf.commitIndex,
-		}
-		rf.mu.Unlock()
-
-		reply := &AppendEntriesReply{}
-		if rf.sendAppendEntries(peer, args, reply) {
-			rf.mu.Lock()
-			if reply.Success {
-				rf.matchIndex[peer] = args.PrevLogIndex + len(args.Entries)
-				rf.nextIndex[peer] = rf.matchIndex[peer] + 1
-				rf.mu.Unlock()
-				return
-			} else {
-				if reply.Term > rf.currentTerm {
-					rf.state = Follower
-					rf.currentTerm = reply.Term
-					rf.votedFor = -1
-					rf.mu.Unlock()
-					return
-				}
-				if rf.nextIndex[peer] > 1 {
-					rf.nextIndex[peer]--
-				}
-			}
-			rf.mu.Unlock()
-		}
-
-		time.Sleep(10 * time.Millisecond)
-	}
 }
